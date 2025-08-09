@@ -1,134 +1,87 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 import joblib
+import pickle
+import numpy as np
 
-# Set page configuration
-st.set_page_config(page_title="Movie Recommender", layout="wide")
+from sklearn.metrics.pairwise import linear_kernel
 
-# Load data
+# Paths
+MODEL_PATH = 'artifacts/svd_model.pkl'
+MOVIES_PATH = 'artifacts/movies.csv'
+RATINGS_PATH = 'artifacts/ratings.csv'
+TFIDF_PATH = 'artifacts/tfidf_genre.pkl'
+GENRE_MATRIX_PATH = 'artifacts/genre_matrix.pkl'
 
 
 @st.cache_data
-def load_data():
-    genre_cols = ['unknown', 'Action', 'Adventure', 'Animation', "Children's", 'Comedy', 'Crime',
-                  'Documentary', 'Drama', 'Fantasy', 'Film-Noir', 'Horror', 'Musical',
-                  'Mystery', 'Romance', 'Sci-Fi', 'Thriller', 'War', 'Western']
-
-    movies = pd.read_csv('ml-100k/u.item', sep='|', encoding='latin-1', header=None,
-                         usecols=[0, 1] + list(range(5, 24)),
-                         names=['movie_id', 'title', 'release_date', 'video_release_date', 'IMDb_URL'] + genre_cols)
-
-    ratings = pd.read_csv('ml-100k/u.data', sep='\t', header=None,
-                          names=['user_id', 'movie_id', 'rating', 'timestamp'])
-
-    movie_stats = ratings.groupby('movie_id').agg(
-        {'rating': ['mean', 'count']})
-    movie_stats.columns = ['avg_rating', 'rating_count']
-    movie_stats = movie_stats.reset_index()
-
-    movies = movies.merge(movie_stats, on='movie_id')
-    return movies, genre_cols
-
-# Load model
+def load_artifacts():
+    algo = joblib.load(MODEL_PATH)
+    movies = pd.read_csv(MOVIES_PATH)
+    ratings = pd.read_csv(RATINGS_PATH)
+    tfidf = joblib.load(TFIDF_PATH)
+    with open(GENRE_MATRIX_PATH, 'rb') as f:
+        genre_matrix = pickle.load(f)
+    return algo, movies, ratings, tfidf, genre_matrix
 
 
-@st.cache_resource
-def load_model():
-    return joblib.load('movie_recommender_model.pkl')
+algo, movies_df, ratings_df, tfidf, genre_matrix = load_artifacts()
 
-# Preprocess features
+st.title('Movie Recommender — MovieLens 100k')
 
+mode = st.sidebar.selectbox('Recommendation mode', [
+                            'By user id (collaborative)', 'By movie (content-based)'])
 
-def preprocess_features(movies, genre_cols):
-    features = movies[genre_cols + ['avg_rating', 'rating_count']]
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(features)
-    return scaled_features
+if mode == 'By user id (collaborative)':
+    st.write('Get top recommendations for an existing user id')
+    user_id = st.number_input('User id', min_value=int(ratings_df.user_id.min(
+    )), max_value=int(ratings_df.user_id.max()), value=int(ratings_df.user_id.min()))
+    n = st.slider('Number of recommendations', 1, 20, 10)
+    if st.button('Recommend'):
+        # compute predictions for all unseen movies
+        with st.spinner('Generating recommendations...'):
+            seen = set(ratings_df[ratings_df.user_id == user_id].movie_id)
+            all_movie_ids = movies_df['movie_id'].unique()
+            preds = []
+            for mid in all_movie_ids:
+                if mid in seen:
+                    continue
+                try:
+                    pred = algo.predict(user_id, int(mid))
+                    preds.append((mid, pred.est))
+                except Exception:
+                    continue
+            preds.sort(key=lambda x: x[1], reverse=True)
+            top = preds[:n]
+            result = movies_df[movies_df.movie_id.isin([m for m, _ in top])].merge(pd.DataFrame(
+                top, columns=['movie_id', 'est']), on='movie_id').sort_values('est', ascending=False)
+            st.write(result[['movie_id', 'title', 'est']
+                            ].reset_index(drop=True))
 
-# Main app
+else:
+    st.write('Find movies similar to a chosen movie (content-based by genres)')
+    movie_title = st.text_input(
+        'Type part of a movie title to search (e.g. Toy Story)')
+    n = st.slider('Number of similar movies', 1, 20, 10)
+    if movie_title:
+        matches = movies_df[movies_df.title.str.lower(
+        ).str.contains(movie_title.lower())]
+        if matches.empty:
+            st.write('No matching movie found')
+        else:
+            choice = st.selectbox('Choose a movie', matches['title'].tolist())
+            if st.button('Find similar'):
+                chosen = matches[matches.title == choice].iloc[0]
+                idx = movies_df.index[movies_df.movie_id == chosen.movie_id].tolist()[
+                    0]
+                cosine_similarities = linear_kernel(
+                    genre_matrix[idx], genre_matrix).flatten()
+                related_indices = cosine_similarities.argsort()[::-1]
+                related_indices = [i for i in related_indices if i != idx][:n]
+                similar = movies_df.iloc[related_indices].assign(
+                    score=cosine_similarities[related_indices])
+                st.write(similar[['movie_id', 'title', 'score']
+                                 ].reset_index(drop=True))
 
-
-def main():
-    st.title("Movie Recommendation System")
-    st.markdown(
-        "Explore movie clusters and get personalized movie recommendations using the MovieLens dataset.")
-
-    # Load data and model
-    movies, genre_cols = load_data()
-    kmeans = load_model()
-
-    # Assign clusters
-    features = preprocess_features(movies, genre_cols)
-    movies['cluster'] = kmeans.predict(features)
-
-    # Sidebar for filters
-    st.sidebar.header("Filter Options")
-    selected_genres = st.sidebar.multiselect(
-        "Select Genres", genre_cols, default=['Comedy', 'Drama'])
-    min_rating = st.sidebar.slider(
-        "Minimum Average Rating", 1.0, 5.0, 3.0, step=0.1)
-    min_ratings = st.sidebar.slider("Minimum Number of Ratings", 1, 500, 50)
-
-    # Filter movies
-    filtered_movies = movies[movies['avg_rating'] >= min_rating]
-    filtered_movies = filtered_movies[filtered_movies['rating_count'] >= min_ratings]
-    if selected_genres:
-        genre_filter = filtered_movies[selected_genres].sum(axis=1) > 0
-        filtered_movies = filtered_movies[genre_filter]
-
-    # Display filtered movies
-    st.header("Filtered Movies")
-    st.dataframe(filtered_movies[[
-                 'title', 'avg_rating', 'rating_count', 'cluster'] + selected_genres].head(50))
-
-    # PCA Visualization
-    st.header("Movie Clusters Visualization")
-    pca = PCA(n_components=2)
-    pca_features = pca.fit_transform(features)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.scatterplot(x=pca_features[:, 0], y=pca_features[:, 1],
-                    hue=movies['cluster'], palette='Set2', s=60, ax=ax)
-    ax.set_title('Movie Clusters Visualized using PCA')
-    ax.set_xlabel('PCA Component 1')
-    ax.set_ylabel('PCA Component 2')
-    ax.legend(title='Cluster', loc='best')
-    ax.grid(True)
-    st.pyplot(fig)
-
-    # Cluster Profiles
-    st.header("Cluster Profiles")
-    cluster_profiles = movies.groupby(
-        'cluster')[genre_cols + ['avg_rating', 'rating_count']].mean()
-    cluster_profiles['num_movies'] = movies['cluster'].value_counts(
-    ).sort_index()
-    st.dataframe(cluster_profiles.round(2))
-
-    # Movie Recommendation
-    st.header("Get Movie Recommendations")
-    selected_movie = st.selectbox(
-        "Select a Movie", movies['title'].sort_values())
-    if selected_movie:
-        selected_movie_id = movies[movies['title']
-                                   == selected_movie]['movie_id'].iloc[0]
-        selected_cluster = movies[movies['title']
-                                  == selected_movie]['cluster'].iloc[0]
-
-        # Recommend movies from the same cluster
-        recommendations = movies[movies['cluster'] == selected_cluster][[
-            'title', 'avg_rating', 'rating_count']]
-        recommendations = recommendations[recommendations['title'] != selected_movie].head(
-            5)
-
-        st.subheader(f"Recommended Movies (Cluster {selected_cluster})")
-        st.dataframe(recommendations)
-
-
-if __name__ == "__main__":
-    main()
+st.sidebar.markdown('---')
+st.sidebar.write('Artifacts loaded from `artifacts/`')
